@@ -1,4 +1,5 @@
-"""Asistente universitario: organizador de tareas con calendario (.ics) y generador de bibliografía APA 7.
+"""Asistente universitario: organizador de tareas con calendario (.ics), generador de bibliografía APA 7
+y formateador de documentos Word al formato APA 7.
 
 - Tus datos viven solo en tu sesión del navegador: cada visitante ve únicamente lo suyo.
 - Para conservarlos entre visitas, descarga la copia de seguridad (.json) y vuélvela a cargar.
@@ -228,6 +229,241 @@ def crear_docx(referencias):
     return buf.getvalue()
 
 
+
+# =============================================================================== formateador APA de documentos Word
+FUENTES_APA = {"Times New Roman 12": ("Times New Roman", 12), "Calibri 11": ("Calibri", 11),
+               "Arial 11": ("Arial", 11), "Georgia 11": ("Georgia", 11), "Lucida Sans Unicode 10": ("Lucida Sans Unicode", 10)}
+TITULOS_REFERENCIAS = {"referencias", "referencias bibliográficas", "referencias bibliograficas", "bibliografía",
+                       "bibliografia", "lista de referencias", "references", "bibliography"}
+
+
+def _quitar_tema_fuente(elemento_rpr, nombre):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn as _qn
+    rf = elemento_rpr.find(_qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts")
+        elemento_rpr.insert(0, rf)
+    for a in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+        rf.attrib.pop(_qn(a), None)
+    for a in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        rf.set(_qn(a), nombre)
+
+
+def _estilo_apa(estilo, fuente, tam, negrita=None, cursiva=None, alineacion=None, sangria=None):
+    from docx.shared import Cm, Pt, RGBColor
+    f = estilo.font
+    f.name, f.size = fuente, Pt(tam)
+    f.color.rgb = RGBColor(0, 0, 0)
+    if negrita is not None:
+        f.bold = negrita
+    if cursiva is not None:
+        f.italic = cursiva
+    _quitar_tema_fuente(estilo.element.get_or_add_rPr(), fuente)
+    pf = estilo.paragraph_format
+    pf.space_before = pf.space_after = Pt(0)
+    pf.line_spacing = 2
+    if alineacion is not None:
+        pf.alignment = alineacion
+    if sangria is not None:
+        pf.left_indent = Cm(sangria)
+        pf.first_line_indent = Cm(0)
+
+
+def _limpiar_runs(p_xml, quitar_color=False):
+    from docx.oxml.ns import qn as _qn
+    for r in p_xml.iter(_qn("w:r")):
+        rpr = r.find(_qn("w:rPr"))
+        if rpr is None:
+            continue
+        tags = ["w:rFonts", "w:sz", "w:szCs"] + (["w:color", "w:highlight"] if quitar_color else [])
+        for t in tags:
+            for el in rpr.findall(_qn(t)):
+                rpr.remove(el)
+
+
+def _es_vacio(p):
+    from docx.oxml.ns import qn as _qn
+    if p.text.strip():
+        return False
+    x = p._p
+    if x.find(".//" + _qn("w:drawing")) is not None or x.find(".//" + _qn("w:pict")) is not None:
+        return False
+    if x.find(".//" + _qn("w:br")) is not None or x.find(".//" + _qn("w:object")) is not None:
+        return False
+    if x.find(".//" + _qn("w:fldChar")) is not None or x.find(".//" + _qn("w:sectPr")) is not None:
+        return False
+    return True
+
+
+def _numero_de_pagina(seccion, fuente, tam):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn as _qn
+    from docx.shared import Pt
+    enc = seccion.header
+    enc.is_linked_to_previous = False
+    for p in list(enc.paragraphs)[1:]:
+        p._p.getparent().remove(p._p)
+    p = enc.paragraphs[0]
+    for r in list(p._p):
+        if r.tag != _qn("w:pPr"):
+            p._p.remove(r)
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = p.add_run()
+    run.font.name, run.font.size = fuente, Pt(tam)
+    for tipo, texto in (("begin", None), (None, " PAGE "), ("separate", None), (None, "1"), ("end", None)):
+        if tipo:
+            el = OxmlElement("w:fldChar")
+            el.set(_qn("w:fldCharType"), tipo)
+        elif texto.strip() == "PAGE":
+            el = OxmlElement("w:instrText")
+            el.set(_qn("xml:space"), "preserve")
+            el.text = texto
+        else:
+            el = OxmlElement("w:t")
+            el.text = texto
+        run._r.append(el)
+
+
+def formatear_apa(datos, fuente_nombre, tam, papel, portada, quitar_vacios, titulos_visuales):
+    """Aplica estructura APA 7 a un .docx. No cambia el texto. Devuelve (bytes, informe)."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm, Pt
+
+    doc = Document(io.BytesIO(datos))
+    inf = {"niveles": {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}, "cuerpo": 0, "listas": 0, "vacios": 0,
+           "referencias": False, "tablas": len(doc.tables), "imagenes": len(doc.inline_shapes), "avisos": []}
+    C, L = WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT
+
+    # --- estilos (se conservan los estilos de título de Word: sigue funcionando el panel de navegación y el índice)
+    _estilo_apa(doc.styles["Normal"], fuente_nombre, tam)
+    doc.styles["Normal"].paragraph_format.line_spacing = None  # tablas y encabezados no se tocan
+    doc.styles["Normal"].paragraph_format.space_after = None
+    doc.styles["Normal"].paragraph_format.space_before = None
+    for nombre, kw in {"Heading 1": dict(negrita=True, cursiva=False, alineacion=C),
+                       "Heading 2": dict(negrita=True, cursiva=False, alineacion=L),
+                       "Heading 3": dict(negrita=True, cursiva=True, alineacion=L),
+                       "Heading 4": dict(negrita=True, cursiva=False, alineacion=L, sangria=1.27),
+                       "Heading 5": dict(negrita=True, cursiva=True, alineacion=L, sangria=1.27),
+                       "Title": dict(negrita=True, cursiva=False, alineacion=C)}.items():
+        try:
+            _estilo_apa(doc.styles[nombre], fuente_nombre, tam, **kw)
+        except KeyError:
+            pass
+
+    # --- página: márgenes, tamaño y número de página
+    ancho, alto = (21.59, 27.94) if papel == "Carta" else (21.0, 29.7)
+    for sec in doc.sections:
+        sec.page_width, sec.page_height = Cm(ancho), Cm(alto)
+        sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Cm(2.54)
+    _numero_de_pagina(doc.sections[0], fuente_nombre, tam)
+
+    # --- párrafos
+    en_referencias = False
+    parrafos = list(doc.paragraphs)
+    for p in parrafos:
+        nombre = (p.style.name if p.style is not None else "") or ""
+        pf = p.paragraph_format
+        if quitar_vacios and _es_vacio(p):
+            p._p.getparent().remove(p._p)
+            inf["vacios"] += 1
+            continue
+        if nombre.startswith(("TOC", "Table of", "Índice", "Contents")):
+            continue
+        es_titulo = nombre == "Title" or re.fullmatch(r"Heading [1-9]", nombre) is not None
+        nivel = 1 if nombre == "Title" else (min(int(nombre.split()[-1]), 5) if es_titulo else 0)
+        texto = p.text.strip()
+        if not es_titulo and titulos_visuales and texto and len(texto) <= 80 and not texto.endswith((".", ":", ";", ",")):
+            runs_txt = [r for r in p.runs if r.text.strip()]
+            if runs_txt and all(r.bold for r in runs_txt) and "List" not in nombre \
+                    and (p._p.pPr is None or p._p.pPr.numPr is None):
+                es_titulo, nivel = True, 1
+                p.alignment = C
+                for r in runs_txt:
+                    r.bold = True
+
+        if es_titulo:
+            inf["niveles"][nivel] += 1
+            _limpiar_runs(p._p, quitar_color=True)
+            pf.space_before = pf.space_after = Pt(0)
+            pf.line_spacing = 2
+            pf.first_line_indent = Cm(0)
+            if nivel <= 3:
+                pf.left_indent = Cm(0)
+            en_referencias = texto.lower().strip(" :.") in TITULOS_REFERENCIAS
+            if en_referencias:
+                inf["referencias"] = True
+                pf.page_break_before = True
+                p.alignment = C
+            continue
+
+        _limpiar_runs(p._p)
+        es_lista = (p._p.pPr is not None and p._p.pPr.numPr is not None) or nombre.startswith("List")
+        pf.space_before = pf.space_after = Pt(0)
+        pf.line_spacing = 2
+        if es_lista:
+            inf["listas"] += 1
+            continue
+        if "Caption" in nombre or nombre == "Leyenda":
+            continue
+        if p.alignment == C and len(texto) <= 100:
+            pf.first_line_indent = Cm(0)
+            continue
+        inf["cuerpo"] += 1
+        p.alignment = L
+        if en_referencias:  # sangría francesa
+            pf.left_indent, pf.first_line_indent = Cm(1.27), Cm(-1.27)
+        elif pf.left_indent is not None and pf.left_indent > Cm(0.9):  # cita en bloque
+            pf.first_line_indent = Cm(0)
+        else:
+            pf.left_indent, pf.first_line_indent = Cm(0), Cm(1.27)
+
+    # tablas: solo se unifica la tipografía
+    for t in doc.tables:
+        for fila in t.rows:
+            for celda in fila.cells:
+                for p in celda.paragraphs:
+                    _limpiar_runs(p._p)
+
+    if sum(inf["niveles"].values()) == 0:
+        inf["avisos"].append("No se encontraron títulos con los estilos de Word (Título 1, 2, 3). "
+                             "Si tus títulos solo tienen negrita, activa «Detectar títulos en negrita».")
+    if not inf["referencias"]:
+        inf["avisos"].append("No se encontró una sección llamada «Referencias» (o «Bibliografía»): no se aplicó sangría francesa.")
+
+    # --- portada (hoja de título de trabajo estudiantil)
+    if portada:
+        datos_portada = [(portada["titulo"], True), (portada["autor"], False), (portada["institucion"], False),
+                         (portada["curso"], False), (portada["profesor"], False), (portada["fecha"], False)]
+        primero = doc.element.body[0]
+        creados = []
+        for i, (txt, neg) in enumerate([d for d in datos_portada if d[0].strip()]):
+            par = doc.add_paragraph()
+            par.alignment = C
+            par.paragraph_format.line_spacing = 2
+            par.paragraph_format.space_before = Pt(72) if i == 0 else Pt(0)
+            par.paragraph_format.space_after = Pt(0)
+            par.paragraph_format.first_line_indent = Cm(0)
+            r = par.add_run(txt.strip())
+            r.bold = neg
+            creados.append(par)
+        for par in creados:
+            primero.addprevious(par._p)
+        resto = [p for p in doc.paragraphs if p not in creados]
+        if resto and doc.element.body.index(resto[0]._p) == len(creados):
+            resto[0].paragraph_format.page_break_before = True
+        else:
+            salto = doc.add_paragraph()
+            salto.paragraph_format.page_break_before = True
+            primero.addprevious(salto._p)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue(), inf
+
+
 # =============================================================================== interfaz
 def _estado():
     st.session_state.setdefault("tareas", [])
@@ -385,15 +621,67 @@ def pestana_apa():
             st.rerun()
 
 
+def pestana_formato():
+    st.caption("Sube tu informe en Word y la app le aplica la **estructura de formato APA 7**. No cambia tu texto, "
+               "no revisa citas ni corrige referencias: solo el formato.")
+    f = st.file_uploader("Documento Word (.docx)", type="docx", key="doc_apa")
+    c1, c2 = st.columns(2)
+    fuente = c1.selectbox("Fuente y tamaño", list(FUENTES_APA))
+    papel = c2.selectbox("Tamaño de papel", ["A4", "Carta"], help="APA usa Carta; en Perú se suele usar A4.")
+    c3, c4 = st.columns(2)
+    quitar_vacios = c3.checkbox("Eliminar párrafos vacíos", value=True)
+    titulos_visuales = c4.checkbox("Detectar títulos en negrita", value=False,
+                                   help="Úsalo si tus títulos no tienen los estilos Título 1, 2, 3 de Word. Los trata como nivel 1.")
+    con_portada = st.checkbox("Agregar portada (hoja de título)")
+    portada = None
+    if con_portada:
+        portada = {}
+        portada["titulo"] = st.text_input("Título del trabajo")
+        a, b = st.columns(2)
+        portada["autor"] = a.text_input("Autor(es)")
+        portada["institucion"] = b.text_input("Institución / facultad")
+        c, d, e = st.columns(3)
+        portada["curso"] = c.text_input("Curso")
+        portada["profesor"] = d.text_input("Docente")
+        portada["fecha"] = e.text_input("Fecha de entrega", placeholder="20 de noviembre de 2026")
+
+    if f is not None and st.button("Aplicar formato APA", type="primary"):
+        try:
+            nombre, tam = FUENTES_APA[fuente]
+            datos, inf = formatear_apa(f.getvalue(), nombre, tam, papel, portada, quitar_vacios, titulos_visuales)
+            st.session_state["apa_doc"] = (datos, inf, re.sub(r"\.docx$", "", f.name, flags=re.I) + "_APA.docx")
+        except Exception as e:  # archivo dañado, protegido, etc.
+            st.session_state.pop("apa_doc", None)
+            st.error(f"No pude procesar el archivo ({type(e).__name__}). Prueba abrirlo y guardarlo de nuevo en Word.")
+
+    if "apa_doc" in st.session_state:
+        datos, inf, nombre = st.session_state["apa_doc"]
+        st.success("Documento formateado.")
+        st.download_button("⬇️ Descargar Word con formato APA", datos, nombre,
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        niv = ", ".join(f"nivel {k}: {v}" for k, v in inf["niveles"].items() if v) or "ninguno"
+        st.markdown(f"**Qué se aplicó:** márgenes de 2,54 cm, interlineado doble sin espacio entre párrafos, "
+                    f"sangría de 1,27 cm en cada párrafo, texto alineado a la izquierda, número de página arriba a la derecha. \n"
+                    f"**Títulos encontrados:** {niv}. **Párrafos de texto:** {inf['cuerpo']}. "
+                    f"**Vacíos eliminados:** {inf['vacios']}. **Referencias con sangría francesa:** {'sí' if inf['referencias'] else 'no'}.")
+        for a in inf["avisos"]:
+            st.warning(a)
+        st.info("Revisa a mano: las mayúsculas de los títulos, las citas dentro del texto, y las tablas y figuras "
+                f"({inf['tablas']} tablas y {inf['imagenes']} imágenes se dejaron como estaban, solo con la misma tipografía). "
+                "Los títulos de nivel 4 y 5 quedan en línea aparte, no en la misma línea del párrafo como pide APA.")
+
+
 def main():
     st.set_page_config(page_title="Asistente universitario", page_icon="🎓", layout="centered")
     _estado()
     st.title("🎓 Asistente universitario")
-    t1, t2 = st.tabs(["📅 Tareas y recordatorios", "📚 Bibliografía APA"])
+    t1, t2, t3 = st.tabs(["📅 Tareas y recordatorios", "📚 Bibliografía APA", "📄 Formato APA de documento"])
     with t1:
         pestana_tareas()
     with t2:
         pestana_apa()
+    with t3:
+        pestana_formato()
 
 
 if __name__ == "__main__":
